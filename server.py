@@ -1,12 +1,12 @@
-import socket
-import threading
+import asyncio
+import websockets
 import random
 import string
 import os
+import json
 
-# Render dynamically assigns a port via environment variables
 PORT = int(os.environ.get("PORT", 6000))
-connected_clients = {}
+connected_clients = {}  # Maps ID -> {"ws": websocket, "password": pwd}
 
 def generate_credentials():
     while True:
@@ -16,39 +16,54 @@ def generate_credentials():
     pwd = ''.join(random.choices(string.ascii_lowercase + string.digits, k=4))
     return uid, pwd
 
-def handle_client(conn, addr):
+async def handler(websocket, path):
     my_id, my_pwd = generate_credentials()
-    connected_clients[my_id] = {"conn": conn, "password": my_pwd}
+    connected_clients[my_id] = {"ws": websocket, "password": my_pwd}
+    print(f"[Server] Client connected. Assigned ID: {my_id}")
+    
     try:
-        conn.sendall(f"CREDENTIALS:{my_id}:{my_pwd}".encode('utf-8'))
-        while True:
-            data = conn.recv(1024).decode('utf-8')
-            if not data: break
-            if data.startswith("CONNECT:"):
-                _, target_id, target_pwd = data.split(":")
+        # Send initial registration credentials
+        await websocket.send(json.dumps({"type": "CREDENTIALS", "id": my_id, "pwd": my_pwd}))
+        
+        async for message in websocket:
+            data = json.loads(message)
+            
+            if data.get("type") == "CONNECT":
+                target_id = data.get("target_id")
+                target_pwd = data.get("target_pwd")
+                
                 if target_id in connected_clients and target_id != my_id:
                     if connected_clients[target_id]["password"] == target_pwd:
-                        target_conn = connected_clients[target_id]["conn"]
-                        target_conn.sendall(f"PAIR_AS_SENDER:{addr[0]}".encode('utf-8'))
-                        conn.sendall(f"PAIR_AS_RECEIVER:{target_conn.getpeername()[0]}".encode('utf-8'))
+                        target_ws = connected_clients[target_id]["ws"]
+                        
+                        # Tell both apps to link together via the signaling server relay
+                        await target_ws.send(json.dumps({"type": "PAIR_AS_SENDER", "peer_id": my_id}))
+                        await websocket.send(json.dumps({"type": "PAIR_AS_RECEIVER", "peer_id": target_id}))
                     else:
-                        conn.sendall(b"ERROR:Incorrect Password")
+                        await websocket.send(json.dumps({"type": "ERROR", "msg": "Incorrect Password"}))
                 else:
-                    conn.sendall(b"ERROR:Invalid ID or Partner Offline")
-    except Exception: pass
+                    await websocket.send(json.dumps({"type": "ERROR", "msg": "Invalid ID or Partner Offline"}))
+                    
+            elif data.get("type") == "STREAM_DATA":
+                # Relay screen frame data to the matching receiver
+                target_id = data.get("target_id")
+                if target_id in connected_clients:
+                    await connected_clients[target_id]["ws"].send(json.dumps({
+                        "type": "FRAME", 
+                        "frame": data.get("frame")
+                    }))
+                    
+    except websockets.ConnectionClosed:
+        pass
     finally:
-        if my_id in connected_clients: del connected_clients[my_id]
-        conn.close()
+        if my_id in connected_clients:
+            del connected_clients[my_id]
+        print(f"[Server] Client {my_id} disconnected.")
 
-def main():
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(('0.0.0.0', PORT))
-    server.listen(50)
-    print(f"Server active on port {PORT}")
-    while True:
-        conn, addr = server.accept()
-        threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
+async def main():
+    async with websockets.serve(handler, "0.0.0.0", PORT):
+        print(f"[Server] SSRD WebSocket Signaling active on port {PORT}")
+        await asyncio.Future()  # run forever
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
