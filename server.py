@@ -6,7 +6,7 @@ import os
 import json
 
 PORT = int(os.environ.get("PORT", 6000))
-connected_clients = {}  # Maps ID -> {"ws": websocket, "password": pwd}
+connected_clients = {}
 
 def generate_credentials():
     while True:
@@ -19,51 +19,52 @@ def generate_credentials():
 async def handler(websocket, path):
     my_id, my_pwd = generate_credentials()
     connected_clients[my_id] = {"ws": websocket, "password": my_pwd}
-    print(f"[Server] Client connected. Assigned ID: {my_id}")
+    print(f"[Server] Connected: {my_id}")
     
     try:
-        # Send initial registration credentials
         await websocket.send(json.dumps({"type": "CREDENTIALS", "id": my_id, "pwd": my_pwd}))
         
         async for message in websocket:
             data = json.loads(message)
+            msg_type = data.get("type")
             
-            if data.get("type") == "CONNECT":
+            if msg_type == "CONNECT":
                 target_id = data.get("target_id")
                 target_pwd = data.get("target_pwd")
-                
                 if target_id in connected_clients and target_id != my_id:
                     if connected_clients[target_id]["password"] == target_pwd:
-                        target_ws = connected_clients[target_id]["ws"]
-                        
-                        # Tell both apps to link together via the signaling server relay
-                        await target_ws.send(json.dumps({"type": "PAIR_AS_SENDER", "peer_id": my_id}))
+                        await connected_clients[target_id]["ws"].send(json.dumps({"type": "PAIR_AS_SENDER", "peer_id": my_id}))
                         await websocket.send(json.dumps({"type": "PAIR_AS_RECEIVER", "peer_id": target_id}))
                     else:
                         await websocket.send(json.dumps({"type": "ERROR", "msg": "Incorrect Password"}))
                 else:
                     await websocket.send(json.dumps({"type": "ERROR", "msg": "Invalid ID or Partner Offline"}))
                     
-            elif data.get("type") == "STREAM_DATA":
-                # Relay screen frame data to the matching receiver
+            elif msg_type == "STREAM_DATA":
+                target_id = data.get("target_id")
+                if target_id in connected_clients:
+                    await connected_clients[target_id]["ws"].send(json.dumps({"type": "FRAME", "frame": data.get("frame")}))
+            
+            # --- NEW: FILE TRANSFER RELAY ---
+            elif msg_type == "FILE_CHUNK":
                 target_id = data.get("target_id")
                 if target_id in connected_clients:
                     await connected_clients[target_id]["ws"].send(json.dumps({
-                        "type": "FRAME", 
-                        "frame": data.get("frame")
+                        "type": "RECEIVE_FILE_CHUNK",
+                        "filename": data.get("filename"),
+                        "chunk": data.get("chunk"),
+                        "is_last": data.get("is_last")
                     }))
                     
     except websockets.ConnectionClosed:
         pass
     finally:
-        if my_id in connected_clients:
-            del connected_clients[my_id]
-        print(f"[Server] Client {my_id} disconnected.")
+        if my_id in connected_clients: del connected_clients[my_id]
+        print(f"[Server] Disconnected: {my_id}")
 
 async def main():
     async with websockets.serve(handler, "0.0.0.0", PORT):
-        print(f"[Server] SSRD WebSocket Signaling active on port {PORT}")
-        await asyncio.Future()  # run forever
+        await asyncio.Future()
 
 if __name__ == "__main__":
     asyncio.run(main())
